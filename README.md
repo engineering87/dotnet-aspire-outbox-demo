@@ -1,4 +1,9 @@
-# Outbox Pattern with .NET Aspire, PostgreSQL and ActiveMQ Artemis  
+# Outbox Pattern with .NET Aspire, PostgreSQL and ActiveMQ Artemis
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![issues - dotnet-aspire-outbox-demo](https://img.shields.io/github/issues/engineering87/dotnet-aspire-outbox-demo)](https://github.com/engineering87/dotnet-aspire-outbox-demo/issues)
+[![Language - C#](https://img.shields.io/static/v1?label=Language&message=C%23&color=blueviolet)](https://dotnet.microsoft.com/it-it/languages/csharp)
+[![stars - dotnet-aspire-outbox-demo](https://img.shields.io/github/stars/engineering87/dotnet-aspire-outbox-demo?style=social)](https://github.com/engineering87/dotnet-aspire-outbox-demo)
+
 *A clean and production-ready template for reliable messaging in distributed systems*
 
 ## Table of Contents
