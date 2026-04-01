@@ -15,6 +15,7 @@ namespace SenderService.Outbox
         private readonly string _password;
         private readonly string _addressName;
 
+        private readonly SemaphoreSlim _initLock = new(1, 1);
         private IConnection? _connection;
         private IProducer? _producer;
 
@@ -48,17 +49,29 @@ namespace SenderService.Outbox
             if (_connection is not null && _producer is not null)
                 return;
 
-            var endpoint = ActiveMQ.Artemis.Client.Endpoint.Create(
-                _host,
-                _port,
-                _username,
-                _password);
+            await _initLock.WaitAsync(cancellationToken);
+            try
+            {
+                // Double-check after acquiring lock
+                if (_connection is not null && _producer is not null)
+                    return;
 
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            cts.CancelAfter(TimeSpan.FromSeconds(5));
+                var endpoint = ActiveMQ.Artemis.Client.Endpoint.Create(
+                    _host,
+                    _port,
+                    _username,
+                    _password);
 
-            _connection = await _connectionFactory.CreateAsync(endpoint, cts.Token);
-            _producer = await _connection.CreateProducerAsync(_addressName, RoutingType.Anycast);
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                cts.CancelAfter(TimeSpan.FromSeconds(5));
+
+                _connection = await _connectionFactory.CreateAsync(endpoint, cts.Token);
+                _producer = await _connection.CreateProducerAsync(_addressName, RoutingType.Anycast);
+            }
+            finally
+            {
+                _initLock.Release();
+            }
         }
 
         public async Task PublishAsync(OutboxMessage message, CancellationToken cancellationToken = default)
@@ -68,8 +81,12 @@ namespace SenderService.Outbox
             var artemisMessage = new Message(message.Payload)
             {
                 MessageId = message.Id.ToString(),
-                Subject = message.Type
+                Subject = message.Type,
+                CorrelationId = message.CorrelationId
             };
+
+            // Also add as application property for broader compatibility
+            artemisMessage.ApplicationProperties["CorrelationId"] = message.CorrelationId;
 
             await _producer!.SendAsync(artemisMessage, cancellationToken);
         }
@@ -85,6 +102,8 @@ namespace SenderService.Outbox
             {
                 await _connection.DisposeAsync();
             }
+
+            _initLock.Dispose();
         }
     }
 }

@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using SenderService.Data;
 using SenderService.Data.Entities;
+using System.Diagnostics;
 
 namespace SenderService.Controllers
 {
@@ -19,6 +20,21 @@ namespace SenderService.Controllers
         [HttpPost]
         public async Task<IActionResult> Create([FromBody] EntityItemRequest request)
         {
+            if (string.IsNullOrWhiteSpace(request.Name))
+            {
+                return BadRequest("Name is required.");
+            }
+
+            if (request.Value < 0)
+            {
+                return BadRequest("Value cannot be negative.");
+            }
+
+            // Use existing trace context or generate new correlation ID
+            var correlationId = Activity.Current?.TraceId.ToString()
+                ?? HttpContext.Request.Headers["X-Correlation-ID"].FirstOrDefault()
+                ?? Guid.NewGuid().ToString();
+
             var entity = new EntityItem
             {
                 Id = Guid.NewGuid(),
@@ -41,6 +57,7 @@ namespace SenderService.Controllers
                 AggregateId = entity.Id.ToString(),
                 Type = "EntityItemCreated",
                 Payload = System.Text.Json.JsonSerializer.Serialize(evt),
+                CorrelationId = correlationId,
                 CreatedAt = DateTime.UtcNow
             };
 
@@ -67,5 +84,5 @@ namespace SenderService.Controllers
         }
     }
 
-    public record EntityItemRequest(string Name, decimal Value);
+    public record EntityItemRequest(string? Name, decimal Value);
 }

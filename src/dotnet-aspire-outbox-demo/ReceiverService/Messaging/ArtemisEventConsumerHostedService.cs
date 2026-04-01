@@ -61,15 +61,34 @@ namespace ReceiverService.Messaging
         {
             _logger.LogInformation("ArtemisEventConsumerHostedService starting");
 
-            // Connessione e consumer
+            // Connessione e consumer con retry
             var endpoint = ActiveMQ.Artemis.Client.Endpoint.Create(
                 _host,
                 _port,
                 _username,
                 _password);
 
-            _connection = await _connectionFactory.CreateAsync(endpoint);
-            _consumer = await _connection.CreateConsumerAsync(_addressName, RoutingType.Anycast);
+            const int maxConnectionRetries = 5;
+            for (int attempt = 1; attempt <= maxConnectionRetries; attempt++)
+            {
+                try
+                {
+                    _connection = await _connectionFactory.CreateAsync(endpoint, stoppingToken);
+                    _consumer = await _connection.CreateConsumerAsync(_addressName, RoutingType.Anycast);
+                    break;
+                }
+                catch (Exception ex) when (attempt < maxConnectionRetries && !stoppingToken.IsCancellationRequested)
+                {
+                    _logger.LogWarning(ex, "Failed to connect to Artemis (attempt {Attempt}/{MaxRetries}), retrying...", attempt, maxConnectionRetries);
+                    await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, attempt)), stoppingToken);
+                }
+            }
+
+            if (_connection is null || _consumer is null)
+            {
+                _logger.LogError("Failed to establish connection to Artemis after {MaxRetries} attempts", maxConnectionRetries);
+                return;
+            }
 
             _logger.LogInformation(
                 "Connected to Artemis at {Host}:{Port}, listening on address {Address}",
@@ -85,17 +104,35 @@ namespace ReceiverService.Messaging
                     var bodyJson = msg.GetBody<string>();
                     var type = msg.Subject;
 
-                    if (type == "EntityItemCreated")
+                    // Extract correlation ID for distributed tracing
+                    string? correlationId = msg.CorrelationId;
+                    if (string.IsNullOrEmpty(correlationId) && msg.ApplicationProperties is not null 
+                        && msg.ApplicationProperties.ContainsKey("CorrelationId"))
                     {
-                        await HandleEntityItemCreated(bodyJson, stoppingToken);
+                        correlationId = msg.ApplicationProperties["CorrelationId"]?.ToString();
                     }
-                    else
-                    {
-                        _logger.LogWarning("Received message with unknown type {Type}", type);
-                    }
+                    correlationId ??= Guid.NewGuid().ToString();
 
-                    // Ack del messaggio
-                    await _consumer.AcceptAsync(msg);
+                    using var activity = new System.Diagnostics.Activity("ProcessMessage")
+                        .SetTag("messaging.message_id", msg.MessageId)
+                        .SetTag("messaging.correlation_id", correlationId)
+                        .SetTag("messaging.destination", _addressName)
+                        .Start();
+
+                    using (_logger.BeginScope(new Dictionary<string, object> { ["CorrelationId"] = correlationId }))
+                    {
+                        if (type == "EntityItemCreated")
+                        {
+                            await HandleEntityItemCreated(bodyJson, correlationId, stoppingToken);
+                        }
+                        else
+                        {
+                            _logger.LogWarning("Received message with unknown type {Type}", type);
+                        }
+
+                        // Ack del messaggio solo dopo elaborazione riuscita
+                        await _consumer.AcceptAsync(msg);
+                    }
                 }
                 catch (TaskCanceledException) when (stoppingToken.IsCancellationRequested)
                 {
@@ -106,20 +143,27 @@ namespace ReceiverService.Messaging
                 {
                     _logger.LogError(ex, "Error while consuming message from Artemis");
                     // piccola pausa per evitare loop serrato in caso di errori continui
-                    await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
+                    }
+                    catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                    {
+                        break;
+                    }
                 }
             }
 
             _logger.LogInformation("ArtemisEventConsumerHostedService stopping");
         }
 
-        private async Task HandleEntityItemCreated(string json, CancellationToken ct)
+        private async Task HandleEntityItemCreated(string json, string correlationId, CancellationToken ct)
         {
             EntityItemCreatedDto? dto;
 
             try
             {
-                dto = JsonSerializer.Deserialize<EntityItemCreatedDto>(json);
+                dto = JsonSerializer.Deserialize<EntityItemCreatedDto>(json, _jsonOptions);
                 if (dto is null)
                 {
                     _logger.LogWarning("Unable to deserialize EntityItemCreatedDto from payload: {Payload}", json);
@@ -131,6 +175,8 @@ namespace ReceiverService.Messaging
                 _logger.LogError(ex, "Error deserializing EntityItemCreatedDto from payload: {Payload}", json);
                 return;
             }
+
+            _logger.LogInformation("Processing EntityItemCreated for {EntityId} with CorrelationId {CorrelationId}", dto.Id, correlationId);
 
             using var scope = _services.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<ReceiverDbContext>();
@@ -159,6 +205,8 @@ namespace ReceiverService.Messaging
             }
 
             await db.SaveChangesAsync(ct);
+
+            _logger.LogInformation("Successfully processed EntityItemCreated for {EntityId}", dto.Id);
         }
 
         public async ValueTask DisposeAsync()
@@ -180,5 +228,10 @@ namespace ReceiverService.Messaging
             string Name,
             decimal Value,
             DateTime CreatedAt);
+
+        private static readonly JsonSerializerOptions _jsonOptions = new()
+        {
+            PropertyNameCaseInsensitive = true
+        };
     }
 }

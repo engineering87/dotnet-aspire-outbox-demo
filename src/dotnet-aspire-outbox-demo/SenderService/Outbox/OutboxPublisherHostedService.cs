@@ -10,6 +10,7 @@ namespace SenderService.Outbox
         private readonly IServiceProvider _services;
         private readonly ILogger<OutboxPublisherHostedService> _logger;
         private readonly TimeSpan _pollInterval = TimeSpan.FromSeconds(5);
+        private const int MaxRetryCount = 5;
 
         public OutboxPublisherHostedService(
             IServiceProvider services,
@@ -32,7 +33,7 @@ namespace SenderService.Outbox
                     var publisher = scope.ServiceProvider.GetRequiredService<IEventPublisher>();
 
                     var pendingMessages = await db.OutboxMessages
-                        .Where(m => m.ProcessedAt == null)
+                        .Where(m => m.ProcessedAt == null && m.FailedAt == null && m.RetryCount < MaxRetryCount)
                         .OrderBy(m => m.CreatedAt)
                         .Take(50)
                         .ToListAsync(stoppingToken);
@@ -43,11 +44,23 @@ namespace SenderService.Outbox
                         {
                             await publisher.PublishAsync(msg, stoppingToken);
                             msg.ProcessedAt = DateTime.UtcNow;
+                            _logger.LogDebug("Published message {MessageId} with CorrelationId {CorrelationId}", msg.Id, msg.CorrelationId);
+                        }
+                        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                        {
+                            // Shutdown requested, save progress and exit
+                            break;
                         }
                         catch (Exception ex)
                         {
-                            _logger.LogError(ex, "Error publishing outbox message {MessageId}", msg.Id);
+                            _logger.LogError(ex, "Error publishing outbox message {MessageId} with CorrelationId {CorrelationId}", msg.Id, msg.CorrelationId);
                             msg.RetryCount++;
+                            msg.LastError = ex.Message;
+                            if (msg.RetryCount >= MaxRetryCount)
+                            {
+                                msg.FailedAt = DateTime.UtcNow;
+                                _logger.LogWarning("Message {MessageId} moved to dead letter (exceeded max retries)", msg.Id);
+                            }
                         }
                     }
 
@@ -56,12 +69,24 @@ namespace SenderService.Outbox
                         await db.SaveChangesAsync(stoppingToken);
                     }
                 }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    // Shutdown requested, exit gracefully
+                    break;
+                }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "OutboxPublisherHostedService cycle failed");
                 }
 
-                await Task.Delay(_pollInterval, stoppingToken);
+                try
+                {
+                    await Task.Delay(_pollInterval, stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
             }
 
             _logger.LogInformation("OutboxPublisherHostedService stopping");

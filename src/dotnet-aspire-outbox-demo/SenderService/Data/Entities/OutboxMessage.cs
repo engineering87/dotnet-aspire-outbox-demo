@@ -8,8 +8,11 @@ namespace SenderService.Data.Entities
         public string AggregateId { get; set; } = default!;
         public string Type { get; set; } = default!;
         public string Payload { get; set; } = default!;
+        public string CorrelationId { get; set; } = default!;
         public DateTime CreatedAt { get; set; }
         public DateTime? ProcessedAt { get; set; }
         public int RetryCount { get; set; }
+        public string? LastError { get; set; }
+        public DateTime? FailedAt { get; set; }
     }
 }

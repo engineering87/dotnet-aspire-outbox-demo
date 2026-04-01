@@ -18,8 +18,8 @@ var connectionString = builder.Configuration.GetConnectionString("senderdb")
 builder.Services.AddDbContext<SenderDbContext>(options =>
     options.UseNpgsql(connectionString));
 
-// Outbox & AMQP publisher
-builder.Services.AddScoped<IEventPublisher, ArtemisEventPublisher>();
+// Outbox & AMQP publisher (Singleton: manages a single shared connection)
+builder.Services.AddSingleton<IEventPublisher, ArtemisEventPublisher>();
 builder.Services.AddHostedService<OutboxPublisherHostedService>();
 
 // MVC Controllers
