@@ -1,10 +1,6 @@
 ﻿// (c) 2025 Francesco Del Re <francesco.delre.87@gmail.com>
 // This code is licensed under MIT license (see LICENSE.txt for details)
 using ActiveMQ.Artemis.Client;
-using Microsoft.EntityFrameworkCore;
-using ReceiverService.Data;
-using ReceiverService.Data.Entities;
-using System.Text.Json;
 
 namespace ReceiverService.Messaging
 {
@@ -61,91 +57,46 @@ namespace ReceiverService.Messaging
         {
             _logger.LogInformation("ArtemisEventConsumerHostedService starting");
 
-            // Connessione e consumer con retry
             var endpoint = ActiveMQ.Artemis.Client.Endpoint.Create(
                 _host,
                 _port,
                 _username,
                 _password);
 
-            const int maxConnectionRetries = 5;
-            for (int attempt = 1; attempt <= maxConnectionRetries; attempt++)
-            {
-                try
-                {
-                    _connection = await _connectionFactory.CreateAsync(endpoint, stoppingToken);
-                    _consumer = await _connection.CreateConsumerAsync(_addressName, RoutingType.Anycast);
-                    break;
-                }
-                catch (Exception ex) when (attempt < maxConnectionRetries && !stoppingToken.IsCancellationRequested)
-                {
-                    _logger.LogWarning(ex, "Failed to connect to Artemis (attempt {Attempt}/{MaxRetries}), retrying...", attempt, maxConnectionRetries);
-                    await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, attempt)), stoppingToken);
-                }
-            }
-
-            if (_connection is null || _consumer is null)
-            {
-                _logger.LogError("Failed to establish connection to Artemis after {MaxRetries} attempts", maxConnectionRetries);
-                return;
-            }
-
-            _logger.LogInformation(
-                "Connected to Artemis at {Host}:{Port}, listening on address {Address}",
-                _host, _port, _addressName);
-
+            var failedAttempts = 0;
             while (!stoppingToken.IsCancellationRequested)
             {
                 try
                 {
-                    // Receive con CancellationToken per shutdown pulito
-                    var msg = await _consumer.ReceiveAsync(stoppingToken);
+                    _connection = await _connectionFactory.CreateAsync(endpoint, stoppingToken);
+                    _consumer = await _connection.CreateConsumerAsync(_addressName, RoutingType.Anycast, stoppingToken);
+                    failedAttempts = 0;
 
-                    var bodyJson = msg.GetBody<string>();
-                    var type = msg.Subject;
+                    _logger.LogInformation(
+                        "Connected to Artemis at {Host}:{Port}, listening on address {Address}",
+                        _host, _port, _addressName);
 
-                    // Extract correlation ID for distributed tracing
-                    string? correlationId = msg.CorrelationId;
-                    if (string.IsNullOrEmpty(correlationId) && msg.ApplicationProperties is not null 
-                        && msg.ApplicationProperties.ContainsKey("CorrelationId"))
+                    while (true)
                     {
-                        correlationId = msg.ApplicationProperties["CorrelationId"]?.ToString();
-                    }
-                    correlationId ??= Guid.NewGuid().ToString();
-
-                    using var activity = new System.Diagnostics.Activity("ProcessMessage")
-                        .SetTag("messaging.message_id", msg.MessageId)
-                        .SetTag("messaging.correlation_id", correlationId)
-                        .SetTag("messaging.destination", _addressName)
-                        .Start();
-
-                    using (_logger.BeginScope(new Dictionary<string, object> { ["CorrelationId"] = correlationId }))
-                    {
-                        if (type == "EntityItemCreated")
-                        {
-                            await HandleEntityItemCreated(bodyJson, correlationId, stoppingToken);
-                        }
-                        else
-                        {
-                            _logger.LogWarning("Received message with unknown type {Type}", type);
-                        }
-
-                        // Ack del messaggio solo dopo elaborazione riuscita
-                        await _consumer.AcceptAsync(msg);
+                        var msg = await _consumer.ReceiveAsync(stoppingToken);
+                        await HandleMessageAsync(_consumer, msg, stoppingToken);
                     }
                 }
-                catch (TaskCanceledException) when (stoppingToken.IsCancellationRequested)
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
                 {
-                    // shutdown richiesto → esco dal loop senza loggare errori
                     break;
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Error while consuming message from Artemis");
-                    // piccola pausa per evitare loop serrato in caso di errori continui
+                    failedAttempts++;
+                    var delay = TimeSpan.FromSeconds(Math.Min(30, Math.Pow(2, Math.Min(failedAttempts, 5))));
+                    _logger.LogWarning(ex, "Artemis consumer failed (attempt {Attempt}), reconnecting in {Delay}", failedAttempts, delay);
+
+                    await CloseConnectionAsync();
+
                     try
                     {
-                        await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
+                        await Task.Delay(delay, stoppingToken);
                     }
                     catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
                     {
@@ -157,81 +108,99 @@ namespace ReceiverService.Messaging
             _logger.LogInformation("ArtemisEventConsumerHostedService stopping");
         }
 
-        private async Task HandleEntityItemCreated(string json, string correlationId, CancellationToken ct)
+        private async Task HandleMessageAsync(IConsumer consumer, Message msg, CancellationToken stoppingToken)
         {
-            EntityItemCreatedDto? dto;
+            // Extract correlation ID for distributed tracing
+            string? correlationId = msg.CorrelationId;
+            if (string.IsNullOrEmpty(correlationId) && msg.ApplicationProperties is not null
+                && msg.ApplicationProperties.ContainsKey("CorrelationId"))
+            {
+                correlationId = msg.ApplicationProperties["CorrelationId"]?.ToString();
+            }
+            correlationId ??= Guid.NewGuid().ToString();
+
+            using var activity = new System.Diagnostics.Activity("ProcessMessage")
+                .SetTag("messaging.message_id", msg.MessageId)
+                .SetTag("messaging.correlation_id", correlationId)
+                .SetTag("messaging.destination", _addressName)
+                .Start();
+
+            using var logScope = _logger.BeginScope(new Dictionary<string, object> { ["CorrelationId"] = correlationId });
 
             try
             {
-                dto = JsonSerializer.Deserialize<EntityItemCreatedDto>(json, _jsonOptions);
-                if (dto is null)
+                await using var scope = _services.CreateAsyncScope();
+                var processor = scope.ServiceProvider.GetRequiredService<IntegrationEventProcessor>();
+
+                var result = await processor.ProcessAsync(msg.Subject, TryGetBody(msg), stoppingToken);
+
+                if (result == MessageProcessingResult.Processed)
                 {
-                    _logger.LogWarning("Unable to deserialize EntityItemCreatedDto from payload: {Payload}", json);
-                    return;
+                    // Acknowledge only after the projection has been committed.
+                    await consumer.AcceptAsync(msg);
+                }
+                else
+                {
+                    // Poison message: the broker routes rejected messages to the dead-letter address.
+                    _logger.LogWarning("Rejecting message {MessageId}; it will be moved to the dead-letter address", msg.MessageId);
+                    consumer.Reject(msg);
+                }
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                // Leave the message unsettled: the broker redelivers it once the link is closed.
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error processing message {MessageId}, requesting redelivery", msg.MessageId);
+
+                // Avoid a tight redelivery loop while the failure (e.g. database outage) persists.
+                await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
+
+                // Redelivered by the broker; after max-delivery-attempts it is moved to the dead-letter address.
+                consumer.Modify(msg, deliveryFailed: true, undeliverableHere: false);
+            }
+        }
+
+        private string? TryGetBody(Message msg)
+        {
+            try
+            {
+                return msg.GetBody<string>();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Message {MessageId} does not contain a string body", msg.MessageId);
+                return null;
+            }
+        }
+
+        private async Task CloseConnectionAsync()
+        {
+            var consumer = _consumer;
+            var connection = _connection;
+            _consumer = null;
+            _connection = null;
+
+            try
+            {
+                if (consumer is not null)
+                {
+                    await consumer.DisposeAsync();
+                }
+
+                if (connection is not null)
+                {
+                    await connection.DisposeAsync();
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error deserializing EntityItemCreatedDto from payload: {Payload}", json);
-                return;
-            }
-
-            _logger.LogInformation("Processing EntityItemCreated for {EntityId} with CorrelationId {CorrelationId}", dto.Id, correlationId);
-
-            using var scope = _services.CreateScope();
-            var db = scope.ServiceProvider.GetRequiredService<ReceiverDbContext>();
-
-            var existing = await db.EntityItems
-                .FirstOrDefaultAsync(e => e.Id == dto.Id, ct);
-
-            if (existing is null)
-            {
-                existing = new EntityItemProjection
-                {
-                    Id = dto.Id,
-                    Name = dto.Name,
-                    Value = dto.Value,
-                    CreatedAt = dto.CreatedAt,
-                    ReceivedAt = DateTime.UtcNow
-                };
-
-                db.EntityItems.Add(existing);
-            }
-            else
-            {
-                existing.Name = dto.Name;
-                existing.Value = dto.Value;
-                // opzionale: puoi aggiornare anche CreatedAt/ReceivedAt se ti serve
-            }
-
-            await db.SaveChangesAsync(ct);
-
-            _logger.LogInformation("Successfully processed EntityItemCreated for {EntityId}", dto.Id);
-        }
-
-        public async ValueTask DisposeAsync()
-        {
-            if (_consumer is not null)
-            {
-                await _consumer.DisposeAsync();
-            }
-
-            if (_connection is not null)
-            {
-                await _connection.DisposeAsync();
+                _logger.LogDebug(ex, "Error while closing the Artemis connection");
             }
         }
 
-        // DTO di supporto per deserializzazione dell'evento
-        private sealed record EntityItemCreatedDto(
-            Guid Id,
-            string Name,
-            decimal Value,
-            DateTime CreatedAt);
-
-        private static readonly JsonSerializerOptions _jsonOptions = new()
-        {
-            PropertyNameCaseInsensitive = true
-        };
+        public ValueTask DisposeAsync() => new(CloseConnectionAsync());
     }
 }

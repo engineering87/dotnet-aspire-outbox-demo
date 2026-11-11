@@ -22,7 +22,7 @@ A reference application demonstrating reliable event publication with the **Tran
 
 The sample contains two independently persisted services. `SenderService` accepts an HTTP request, saves a domain entity and its outbox record in one database transaction, and publishes the event asynchronously. `ReceiverService` consumes the event from Artemis and stores a read-side projection in its own PostgreSQL database.
 
-The repository is intended for learning and experimentation. It illustrates the core pattern, but is **not a production-ready template**: database initialization currently deletes and recreates both databases at service startup. Review the [limitations](#reliability-and-limitations) before adapting it for another environment.
+The repository is intended for learning and experimentation. It illustrates the core pattern, but is **not a production-ready template**. Review the [limitations](#reliability-and-limitations) before adapting it for another environment.
 
 ## Architecture
 
@@ -39,8 +39,8 @@ Aspire starts the dependencies and injects connection information into the servi
 
 1. A client submits an entity to `SenderService`.
 2. The service writes the entity and a serialized `EntityItemCreated` outbox record in the same database transaction.
-3. A background publisher polls for pending records and sends them to the `entity-items` Artemis address.
-4. After processing the event, `ReceiverService` stores or updates its projection and acknowledges the message.
+3. A background publisher claims pending records and sends them as durable messages to the `entity-items` Artemis address. A record is marked as processed only after the broker accepts the message.
+4. After processing the event, `ReceiverService` stores or updates its projection and acknowledges the message only after the database commit.
 5. Clients can query the receiver’s projection API.
 
 This makes the sender’s database write and event record atomic. Publishing and projection updates happen asynchronously, so consistency between services is eventual.
@@ -86,12 +86,17 @@ Swagger is enabled in the Development environment. Check the Aspire dashboard fo
 
 ## Reliability and limitations
 
+The sample provides **at-least-once** delivery end to end.
+
 - **Atomic local write:** the entity and its outbox record are saved in one transaction.
-- **Asynchronous delivery:** the publisher polls every five seconds and processes pending records in batches.
-- **Bounded retries:** a failed publish is retried up to five times; records that reach the limit are marked failed and require operational handling.
-- **Duplicate delivery:** publishing and marking an outbox record as processed are separate operations. A crash between them can result in redelivery, so consumers should be idempotent. The receiver upserts projections by entity ID.
-- **Database reset:** both services currently call `EnsureDeleted()` followed by `EnsureCreated()` at startup. This intentionally resets local demo data and is unsuitable for production. Replace this behavior with EF Core migrations and an explicit data-retention strategy before deploying elsewhere.
-- **Broker behavior:** delivery and retention guarantees depend on Artemis address, queue, and persistence configuration. Validate those settings for your deployment requirements.
+- **Asynchronous delivery:** the publisher polls every five seconds and processes pending records in batches of 50, immediately continuing while full batches are available.
+- **Multiple sender instances:** each batch is claimed with PostgreSQL `FOR UPDATE SKIP LOCKED`, so concurrent publishers never send the same record at the same time. Global ordering across instances is not guaranteed.
+- **Retries:** each publish attempt has a 10-second timeout. On failure, the record stays pending, the batch stops, and the record is retried after 30 seconds. Persistent failures are visible through `RetryCount`, `LastError`, and `FailedAt` and require monitoring.
+- **Duplicate prevention:** messages carry the outbox ID as Artemis duplicate detection ID (`_AMQ_DUPL_ID`), so a re-published record is accepted but not routed twice while it remains in the broker's duplicate ID cache.
+- **Idempotent consumer:** duplicates can still occur (for example, after the duplicate ID cache rotates), so the receiver upserts projections by entity ID.
+- **Failure handling in the receiver:** transient processing failures are returned to the broker for redelivery. Unknown event types and invalid payloads are rejected and moved to the `DLQ` address, as are messages that exceed Artemis `max-delivery-attempts` (10 by default). Dead-lettered messages need operational handling.
+- **Broker durability:** the Artemis journal is stored in the `artemisdata` volume, so queued messages survive container re-creation.
+- **Database initialization:** both services use `EnsureCreated()` without deleting existing data. It does not update an existing schema; introduce EF Core migrations and plan the transition for existing databases before evolving the model.
 
 ## Technology stack
 
@@ -103,7 +108,7 @@ Swagger is enabled in the Development environment. Check the Aspire dashboard fo
 
 ## Purpose
 
-Use this repository as a learning reference or a starting point for exploring message-driven services. Before using the sample as a production foundation, address the operational limitations described above, particularly database lifecycle, retry/dead-letter handling, and broker durability.
+Use this repository as a learning reference or a starting point for exploring message-driven services. Before using the sample as a production foundation, address the operational limitations described above, particularly schema migrations, dead-letter handling, and monitoring of pending outbox records.
 
 ## License
 

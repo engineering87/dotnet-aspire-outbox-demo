@@ -170,42 +170,59 @@ public class OutboxPublisherHostedServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task ExecuteAsync_SkipsFailedMessages()
+    public async Task ExecuteAsync_RetriesPreviouslyFailedMessages()
     {
-        // Arrange
         var failedMessage = CreateOutboxMessage();
-        failedMessage.FailedAt = DateTime.UtcNow;
+        failedMessage.FailedAt = DateTime.UtcNow - OutboxPublisherHostedService.RetryDelay - TimeSpan.FromSeconds(1);
         failedMessage.RetryCount = 5;
+        failedMessage.LastError = "Broker unavailable";
         using (var db = CreateDbContext())
         {
             db.OutboxMessages.Add(failedMessage);
             await db.SaveChangesAsync();
         }
 
-        var service = new OutboxPublisherHostedService(_serviceProvider, _mockLogger.Object);
-        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+        var published = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _mockPublisher
+            .Setup(p => p.PublishAsync(It.IsAny<OutboxMessage>(), It.IsAny<CancellationToken>()))
+            .Callback(() => published.TrySetResult())
+            .Returns(Task.CompletedTask);
 
-        // Act
+        var service = new OutboxPublisherHostedService(_serviceProvider, _mockLogger.Object);
+        await service.StartAsync(CancellationToken.None);
         try
         {
-            await service.StartAsync(cts.Token);
-            await Task.Delay(50);
+            await published.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            while (true)
+            {
+                using var db = CreateDbContext();
+                var saved = await db.OutboxMessages.FindAsync(failedMessage.Id);
+                if (saved?.ProcessedAt is not null)
+                {
+                    saved.FailedAt.Should().BeNull();
+                    saved.LastError.Should().BeNull();
+                    break;
+                }
+                await Task.Delay(10, timeout.Token);
+            }
+        }
+        finally
+        {
             await service.StopAsync(CancellationToken.None);
         }
-        catch (OperationCanceledException) { }
 
-        // Assert
         _mockPublisher.Verify(
-            p => p.PublishAsync(It.IsAny<OutboxMessage>(), It.IsAny<CancellationToken>()),
-            Times.Never);
+            p => p.PublishAsync(It.Is<OutboxMessage>(m => m.Id == failedMessage.Id), It.IsAny<CancellationToken>()),
+            Times.Once);
     }
 
     [Fact]
-    public async Task ExecuteAsync_WhenMaxRetriesExceeded_MarksMessageAsFailed()
+    public async Task ExecuteAsync_WhenFiveAttemptsFail_MessageRemainsPending()
     {
         // Arrange
         var message = CreateOutboxMessage();
-        message.RetryCount = 4; // One more failure will exceed max (5)
+        message.RetryCount = 4;
         using (var db = CreateDbContext())
         {
             db.OutboxMessages.Add(message);
@@ -233,7 +250,132 @@ public class OutboxPublisherHostedServiceTests : IDisposable
         {
             var updatedMessage = await db.OutboxMessages.FindAsync(message.Id);
             updatedMessage!.FailedAt.Should().NotBeNull();
+            updatedMessage.ProcessedAt.Should().BeNull();
             updatedMessage.RetryCount.Should().Be(5);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_DoesNotRetryMessageWithinRetryDelay()
+    {
+        var recentlyFailed = CreateOutboxMessage();
+        recentlyFailed.FailedAt = DateTime.UtcNow;
+        recentlyFailed.RetryCount = 1;
+        var pending = CreateOutboxMessage();
+        using (var db = CreateDbContext())
+        {
+            db.OutboxMessages.AddRange(recentlyFailed, pending);
+            await db.SaveChangesAsync();
+        }
+
+        var published = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _mockPublisher
+            .Setup(p => p.PublishAsync(It.IsAny<OutboxMessage>(), It.IsAny<CancellationToken>()))
+            .Callback(() => published.TrySetResult())
+            .Returns(Task.CompletedTask);
+
+        var service = new OutboxPublisherHostedService(_serviceProvider, _mockLogger.Object);
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            await published.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+
+        _mockPublisher.Verify(
+            p => p.PublishAsync(It.Is<OutboxMessage>(m => m.Id == pending.Id), It.IsAny<CancellationToken>()),
+            Times.Once);
+        _mockPublisher.Verify(
+            p => p.PublishAsync(It.Is<OutboxMessage>(m => m.Id == recentlyFailed.Id), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_WhenPublishFails_StopsCurrentBatch()
+    {
+        var first = CreateOutboxMessage(DateTime.UtcNow.AddMinutes(-2));
+        var second = CreateOutboxMessage(DateTime.UtcNow.AddMinutes(-1));
+        using (var db = CreateDbContext())
+        {
+            db.OutboxMessages.AddRange(first, second);
+            await db.SaveChangesAsync();
+        }
+
+        var attempted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _mockPublisher
+            .Setup(p => p.PublishAsync(It.IsAny<OutboxMessage>(), It.IsAny<CancellationToken>()))
+            .Callback(() => attempted.TrySetResult())
+            .ThrowsAsync(new Exception("Broker unavailable"));
+
+        var service = new OutboxPublisherHostedService(_serviceProvider, _mockLogger.Object);
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            await attempted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await WaitUntilAsync(async () =>
+            {
+                using var db = CreateDbContext();
+                return (await db.OutboxMessages.FindAsync(first.Id))!.RetryCount == 1;
+            });
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+
+        _mockPublisher.Verify(
+            p => p.PublishAsync(It.Is<OutboxMessage>(m => m.Id == second.Id), It.IsAny<CancellationToken>()),
+            Times.Never);
+        using (var db = CreateDbContext())
+        {
+            (await db.OutboxMessages.FindAsync(second.Id))!.RetryCount.Should().Be(0);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_WhenStoppedMidBatch_PersistsAlreadyPublishedMessages()
+    {
+        var first = CreateOutboxMessage(DateTime.UtcNow.AddMinutes(-2));
+        var second = CreateOutboxMessage(DateTime.UtcNow.AddMinutes(-1));
+        using (var db = CreateDbContext())
+        {
+            db.OutboxMessages.AddRange(first, second);
+            await db.SaveChangesAsync();
+        }
+
+        var secondStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _mockPublisher
+            .Setup(p => p.PublishAsync(It.Is<OutboxMessage>(m => m.Id == first.Id), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _mockPublisher
+            .Setup(p => p.PublishAsync(It.Is<OutboxMessage>(m => m.Id == second.Id), It.IsAny<CancellationToken>()))
+            .Returns<OutboxMessage, CancellationToken>(async (_, ct) =>
+            {
+                secondStarted.TrySetResult();
+                await Task.Delay(Timeout.Infinite, ct);
+            });
+
+        var service = new OutboxPublisherHostedService(_serviceProvider, _mockLogger.Object);
+        await service.StartAsync(CancellationToken.None);
+        await secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await service.StopAsync(CancellationToken.None);
+
+        using var verifyDb = CreateDbContext();
+        (await verifyDb.OutboxMessages.FindAsync(first.Id))!.ProcessedAt.Should().NotBeNull();
+        var unpublished = await verifyDb.OutboxMessages.FindAsync(second.Id);
+        unpublished!.ProcessedAt.Should().BeNull();
+        unpublished.RetryCount.Should().Be(0);
+    }
+
+    private static async Task WaitUntilAsync(Func<Task<bool>> condition)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (!await condition())
+        {
+            await Task.Delay(10, timeout.Token);
         }
     }
 

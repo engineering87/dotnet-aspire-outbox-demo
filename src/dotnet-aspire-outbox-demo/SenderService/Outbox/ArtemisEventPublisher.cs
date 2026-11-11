@@ -7,6 +7,8 @@ namespace SenderService.Outbox
 {
     public class ArtemisEventPublisher : IEventPublisher, IAsyncDisposable
     {
+        public const string DuplicateDetectionIdProperty = "_AMQ_DUPL_ID";
+
         private readonly ConnectionFactory _connectionFactory = new();
 
         private readonly string _host;
@@ -17,7 +19,7 @@ namespace SenderService.Outbox
 
         private readonly SemaphoreSlim _initLock = new(1, 1);
         private IConnection? _connection;
-        private IProducer? _producer;
+        private volatile IProducer? _producer;
 
         public ArtemisEventPublisher(IConfiguration configuration)
         {
@@ -44,17 +46,17 @@ namespace SenderService.Outbox
             _addressName = configuration.GetValue<string>("Artemis:Address") ?? "entity-items";
         }
 
-        private async Task EnsureInitializedAsync(CancellationToken cancellationToken)
+        private async Task<IProducer> EnsureInitializedAsync(CancellationToken cancellationToken)
         {
-            if (_connection is not null && _producer is not null)
-                return;
+            if (_producer is { } existing)
+                return existing;
 
             await _initLock.WaitAsync(cancellationToken);
             try
             {
                 // Double-check after acquiring lock
-                if (_connection is not null && _producer is not null)
-                    return;
+                if (_producer is { } initialized)
+                    return initialized;
 
                 var endpoint = ActiveMQ.Artemis.Client.Endpoint.Create(
                     _host,
@@ -65,8 +67,19 @@ namespace SenderService.Outbox
                 using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 cts.CancelAfter(TimeSpan.FromSeconds(5));
 
-                _connection = await _connectionFactory.CreateAsync(endpoint, cts.Token);
-                _producer = await _connection.CreateProducerAsync(_addressName, RoutingType.Anycast);
+                var connection = await _connectionFactory.CreateAsync(endpoint, cts.Token);
+                try
+                {
+                    var producer = await connection.CreateProducerAsync(_addressName, RoutingType.Anycast, cts.Token);
+                    _connection = connection;
+                    _producer = producer;
+                    return producer;
+                }
+                catch
+                {
+                    await connection.DisposeAsync();
+                    throw;
+                }
             }
             finally
             {
@@ -76,19 +89,25 @@ namespace SenderService.Outbox
 
         public async Task PublishAsync(OutboxMessage message, CancellationToken cancellationToken = default)
         {
-            await EnsureInitializedAsync(cancellationToken);
+            var producer = await EnsureInitializedAsync(cancellationToken);
 
             var artemisMessage = new Message(message.Payload)
             {
                 MessageId = message.Id.ToString(),
                 Subject = message.Type,
-                CorrelationId = message.CorrelationId
+                CorrelationId = message.CorrelationId,
+                DurabilityMode = DurabilityMode.Durable
             };
 
             // Also add as application property for broader compatibility
             artemisMessage.ApplicationProperties["CorrelationId"] = message.CorrelationId;
 
-            await _producer!.SendAsync(artemisMessage, cancellationToken);
+            // Broker-side duplicate detection: a re-publish of the same outbox record (e.g. after a timeout
+            // whose send actually reached the broker) is accepted but not routed again.
+            artemisMessage.ApplicationProperties[DuplicateDetectionIdProperty] = message.Id.ToString();
+
+            // Completes only when the broker has accepted (and, for durable messages, persisted) the message.
+            await producer.SendAsync(artemisMessage, cancellationToken);
         }
 
         public async ValueTask DisposeAsync()

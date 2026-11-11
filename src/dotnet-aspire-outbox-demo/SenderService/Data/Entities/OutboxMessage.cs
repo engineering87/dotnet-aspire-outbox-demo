@@ -13,6 +13,10 @@ namespace SenderService.Data.Entities
         public DateTime? ProcessedAt { get; set; }
         public int RetryCount { get; set; }
         public string? LastError { get; set; }
+
+        /// <summary>
+        /// Time of the last failed publish attempt; cleared once the message is published.
+        /// </summary>
         public DateTime? FailedAt { get; set; }
     }
 }

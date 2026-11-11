@@ -19,7 +19,10 @@ var artemis = builder
         scheme: "http"
     )
     .WithEnvironment("AMQ_USER", "artemis")
-    .WithEnvironment("AMQ_PASSWORD", "artemis");
+    .WithEnvironment("AMQ_PASSWORD", "artemis")
+    // Keep the journal outside the generated broker instance so queued messages survive container re-creation.
+    .WithEnvironment("AMQ_EXTRA_ARGS", "--data /var/lib/artemis-data")
+    .WithVolume("artemisdata", "/var/lib/artemis-data");
 
 // PostgreSQL for SenderService
 var senderPostgres = builder
