@@ -18,7 +18,7 @@ public static class MockLogger
             x => x.Log(
                 level,
                 It.IsAny<EventId>(),
-                It.Is<It.IsAnyType>((o, t) => o.ToString()!.Contains(messageContains)),
+                It.Is<It.IsAnyType>((o, t) => o != null && o.ToString()!.Contains(messageContains)),
                 It.IsAny<Exception?>(),
                 It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
             Times.AtLeastOnce);
