@@ -7,6 +7,8 @@ namespace SenderService.Outbox
 {
     public class ArtemisEventPublisher : IEventPublisher, IAsyncDisposable
     {
+        public const string DuplicateDetectionIdProperty = "_AMQ_DUPL_ID";
+
         private readonly ConnectionFactory _connectionFactory = new();
 
         private readonly string _host;
@@ -15,8 +17,9 @@ namespace SenderService.Outbox
         private readonly string _password;
         private readonly string _addressName;
 
+        private readonly SemaphoreSlim _initLock = new(1, 1);
         private IConnection? _connection;
-        private IProducer? _producer;
+        private volatile IProducer? _producer;
 
         public ArtemisEventPublisher(IConfiguration configuration)
         {
@@ -43,35 +46,67 @@ namespace SenderService.Outbox
             _addressName = configuration.GetValue<string>("Artemis:Address") ?? "entity-items";
         }
 
-        private async Task EnsureInitializedAsync(CancellationToken cancellationToken)
+        private async Task<IProducer> EnsureInitializedAsync(CancellationToken cancellationToken)
         {
-            if (_connection is not null && _producer is not null)
-                return;
+            if (_producer is { } existing)
+                return existing;
 
-            var endpoint = ActiveMQ.Artemis.Client.Endpoint.Create(
-                _host,
-                _port,
-                _username,
-                _password);
+            await _initLock.WaitAsync(cancellationToken);
+            try
+            {
+                // Double-check after acquiring lock
+                if (_producer is { } initialized)
+                    return initialized;
 
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            cts.CancelAfter(TimeSpan.FromSeconds(5));
+                var endpoint = ActiveMQ.Artemis.Client.Endpoint.Create(
+                    _host,
+                    _port,
+                    _username,
+                    _password);
 
-            _connection = await _connectionFactory.CreateAsync(endpoint, cts.Token);
-            _producer = await _connection.CreateProducerAsync(_addressName, RoutingType.Anycast);
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                cts.CancelAfter(TimeSpan.FromSeconds(5));
+
+                var connection = await _connectionFactory.CreateAsync(endpoint, cts.Token);
+                try
+                {
+                    var producer = await connection.CreateProducerAsync(_addressName, RoutingType.Anycast, cts.Token);
+                    _connection = connection;
+                    _producer = producer;
+                    return producer;
+                }
+                catch
+                {
+                    await connection.DisposeAsync();
+                    throw;
+                }
+            }
+            finally
+            {
+                _initLock.Release();
+            }
         }
 
         public async Task PublishAsync(OutboxMessage message, CancellationToken cancellationToken = default)
         {
-            await EnsureInitializedAsync(cancellationToken);
+            var producer = await EnsureInitializedAsync(cancellationToken);
 
             var artemisMessage = new Message(message.Payload)
             {
                 MessageId = message.Id.ToString(),
-                Subject = message.Type
+                Subject = message.Type,
+                CorrelationId = message.CorrelationId,
+                DurabilityMode = DurabilityMode.Durable
             };
 
-            await _producer!.SendAsync(artemisMessage, cancellationToken);
+            // Also add as application property for broader compatibility
+            artemisMessage.ApplicationProperties["CorrelationId"] = message.CorrelationId;
+
+            // Artemis can suppress a retry while this ID remains in its duplicate detection cache.
+            artemisMessage.ApplicationProperties[DuplicateDetectionIdProperty] = message.Id.ToString();
+
+            // Completes only when the broker has accepted (and, for durable messages, persisted) the message.
+            await producer.SendAsync(artemisMessage, cancellationToken);
         }
 
         public async ValueTask DisposeAsync()
@@ -85,6 +120,8 @@ namespace SenderService.Outbox
             {
                 await _connection.DisposeAsync();
             }
+
+            _initLock.Dispose();
         }
     }
 }

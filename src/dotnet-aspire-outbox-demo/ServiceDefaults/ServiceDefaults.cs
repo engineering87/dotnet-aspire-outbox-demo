@@ -1,9 +1,9 @@
-﻿// (c) 2025 Francesco Del Re <francesco.delre.87@gmail.com>
+// (c) 2025 Francesco Del Re <francesco.delre.87@gmail.com>
 // This code is licensed under MIT license (see LICENSE.txt for details)
 using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using Microsoft.OpenApi.Models;
+using Microsoft.OpenApi;
 
 namespace ServiceDefaults
 {

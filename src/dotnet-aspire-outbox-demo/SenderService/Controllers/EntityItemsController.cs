@@ -4,10 +4,10 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using SenderService.Data;
 using SenderService.Data.Entities;
+using System.Diagnostics;
 
 namespace SenderService.Controllers
 {
-    // SenderService.Controllers/EntityItemsController.cs
     [ApiController]
     [Route("api/[controller]")]
     public class EntityItemsController : ControllerBase
@@ -19,6 +19,21 @@ namespace SenderService.Controllers
         [HttpPost]
         public async Task<IActionResult> Create([FromBody] EntityItemRequest request)
         {
+            if (string.IsNullOrWhiteSpace(request.Name))
+            {
+                return BadRequest("Name is required.");
+            }
+
+            if (request.Value < 0)
+            {
+                return BadRequest("Value cannot be negative.");
+            }
+
+            // Prefer the active trace ID, then the request header, then a generated ID.
+            var correlationId = Activity.Current?.TraceId.ToString()
+                ?? HttpContext.Request.Headers["X-Correlation-ID"].FirstOrDefault()
+                ?? Guid.NewGuid().ToString();
+
             var entity = new EntityItem
             {
                 Id = Guid.NewGuid(),
@@ -41,9 +56,11 @@ namespace SenderService.Controllers
                 AggregateId = entity.Id.ToString(),
                 Type = "EntityItemCreated",
                 Payload = System.Text.Json.JsonSerializer.Serialize(evt),
+                CorrelationId = correlationId,
                 CreatedAt = DateTime.UtcNow
             };
 
+            // Commit the business change and its event record together; the relay publishes later.
             await using var tx = await _db.Database.BeginTransactionAsync();
             _db.EntityItems.Add(entity);
             _db.OutboxMessages.Add(outboxMessage);
@@ -67,5 +84,5 @@ namespace SenderService.Controllers
         }
     }
 
-    public record EntityItemRequest(string Name, decimal Value);
+    public record EntityItemRequest(string? Name, decimal Value);
 }

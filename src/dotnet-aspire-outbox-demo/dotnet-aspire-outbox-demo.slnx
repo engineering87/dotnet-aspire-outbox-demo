@@ -1,5 +1,6 @@
 <Solution>
   <Project Path="dotnet-aspire-outbox-demo/Aspire.AppHost.csproj" />
+  <Project Path="OutboxDemo.Tests/OutboxDemo.Tests.csproj" />
   <Project Path="ReceiverService/ReceiverService.csproj" />
   <Project Path="SenderService/SenderService.csproj" />
   <Project Path="ServiceDefaults/ServiceDefaults.csproj" />
