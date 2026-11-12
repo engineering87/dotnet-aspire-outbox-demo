@@ -122,7 +122,7 @@ namespace SenderService.Outbox
                 }
             }
 
-            // Persist progress even during shutdown, otherwise records already accepted by the broker would be published again.
+            // Commit completed sends during shutdown to reduce unnecessary redelivery; a failed commit can still cause duplicates.
             await db.SaveChangesAsync(CancellationToken.None);
             await transaction.CommitAsync(CancellationToken.None);
 

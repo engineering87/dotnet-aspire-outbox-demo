@@ -8,7 +8,6 @@ using System.Diagnostics;
 
 namespace SenderService.Controllers
 {
-    // SenderService.Controllers/EntityItemsController.cs
     [ApiController]
     [Route("api/[controller]")]
     public class EntityItemsController : ControllerBase
@@ -30,7 +29,7 @@ namespace SenderService.Controllers
                 return BadRequest("Value cannot be negative.");
             }
 
-            // Use existing trace context or generate new correlation ID
+            // Prefer the active trace ID, then the request header, then a generated ID.
             var correlationId = Activity.Current?.TraceId.ToString()
                 ?? HttpContext.Request.Headers["X-Correlation-ID"].FirstOrDefault()
                 ?? Guid.NewGuid().ToString();
@@ -61,6 +60,7 @@ namespace SenderService.Controllers
                 CreatedAt = DateTime.UtcNow
             };
 
+            // Commit the business change and its event record together; the relay publishes later.
             await using var tx = await _db.Database.BeginTransactionAsync();
             _db.EntityItems.Add(entity);
             _db.OutboxMessages.Add(outboxMessage);

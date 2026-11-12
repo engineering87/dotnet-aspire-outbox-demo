@@ -102,8 +102,7 @@ namespace SenderService.Outbox
             // Also add as application property for broader compatibility
             artemisMessage.ApplicationProperties["CorrelationId"] = message.CorrelationId;
 
-            // Broker-side duplicate detection: a re-publish of the same outbox record (e.g. after a timeout
-            // whose send actually reached the broker) is accepted but not routed again.
+            // Artemis can suppress a retry while this ID remains in its duplicate detection cache.
             artemisMessage.ApplicationProperties[DuplicateDetectionIdProperty] = message.Id.ToString();
 
             // Completes only when the broker has accepted (and, for durable messages, persisted) the message.

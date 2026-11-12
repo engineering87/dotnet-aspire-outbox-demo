@@ -16,11 +16,9 @@ var connectionString = builder.Configuration.GetConnectionString("receiverdb")
 builder.Services.AddDbContext<ReceiverDbContext>(options =>
     options.UseNpgsql(connectionString));
 
-// Consumer Artemis
 builder.Services.AddScoped<IntegrationEventProcessor>();
 builder.Services.AddHostedService<ArtemisEventConsumerHostedService>();
 
-// Controller
 builder.Services.AddControllers();
 
 var app = builder.Build();

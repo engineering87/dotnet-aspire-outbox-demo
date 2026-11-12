@@ -20,7 +20,7 @@ namespace ReceiverService.Messaging
     /// Applies integration events to the receiver read model.
     /// </summary>
     /// <remarks>
-    /// Delivery is at-least-once, so handlers are idempotent: applying the same event twice leaves the projection unchanged.
+    /// Reprocessing the same EntityItemCreated payload updates the existing projection rather than inserting another row.
     /// Transient failures (e.g. database unavailable) are thrown so the caller can request a redelivery.
     /// </remarks>
     public class IntegrationEventProcessor

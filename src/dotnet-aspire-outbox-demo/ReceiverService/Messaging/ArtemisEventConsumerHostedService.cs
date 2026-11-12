@@ -110,7 +110,7 @@ namespace ReceiverService.Messaging
 
         private async Task HandleMessageAsync(IConsumer consumer, Message msg, CancellationToken stoppingToken)
         {
-            // Extract correlation ID for distributed tracing
+            // Preserve the correlation ID for message activity tags and log scopes.
             string? correlationId = msg.CorrelationId;
             if (string.IsNullOrEmpty(correlationId) && msg.ApplicationProperties is not null
                 && msg.ApplicationProperties.ContainsKey("CorrelationId"))
@@ -141,7 +141,7 @@ namespace ReceiverService.Messaging
                 }
                 else
                 {
-                    // Poison message: the broker routes rejected messages to the dead-letter address.
+                    // Rejection routing depends on the broker's dead-letter configuration.
                     _logger.LogWarning("Rejecting message {MessageId}; it will be moved to the dead-letter address", msg.MessageId);
                     consumer.Reject(msg);
                 }
@@ -158,7 +158,7 @@ namespace ReceiverService.Messaging
                 // Avoid a tight redelivery loop while the failure (e.g. database outage) persists.
                 await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
 
-                // Redelivered by the broker; after max-delivery-attempts it is moved to the dead-letter address.
+                // Request redelivery; retry limits and dead-letter routing are broker settings.
                 consumer.Modify(msg, deliveryFailed: true, undeliverableHere: false);
             }
         }
